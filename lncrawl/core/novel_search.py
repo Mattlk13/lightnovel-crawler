@@ -1,68 +1,46 @@
-# -*- coding: utf-8 -*-
 """
 To search for novels in selected sources
 """
-import logging
-import os
 import random
-from concurrent import futures
+import logging
+from typing import Dict, List
 
+from concurrent.futures import Future
 from slugify import slugify
-from tqdm import tqdm
+import difflib
 
-from ..core.sources import crawler_list
+from ..models import CombinedSearchResult, SearchResult
+from .sources import crawler_list, prepare_crawler
+from .taskman import TaskManager
 
-SEARCH_TIMEOUT = 10
+SEARCH_TIMEOUT = 60
+MAX_RESULTS = 15
 
 logger = logging.getLogger(__name__)
+taskman = TaskManager(10)
 
-executor = futures.ThreadPoolExecutor(20)
 
-
-def get_search_result(app, link, bar):
+def _perform_search(app, link):
+    from .app import App
+    assert isinstance(app, App)
     try:
-        CrawlerType = crawler_list[link]
-        instance = CrawlerType()
-        instance.home_url = link
-        results = instance.search_novel(app.user_input)
+        crawler = prepare_crawler(link)
+        results = []
+        for item in crawler.search_novel(app.user_input):
+            if not isinstance(item, SearchResult):
+                item = SearchResult(**item)
+            if not (item.url and item.title):
+                continue
+            results.append(item)
         logger.debug(results)
-        logger.info('%d results from %s', len(results), link)
+        logger.info(f"{len(results)} results from {link}")
         return results
-    except KeyboardInterrupt as e:
-        raise e
-    except Exception as e:
+    except Exception:
         if logger.isEnabledFor(logging.DEBUG):
-            logging.debug('Searching failure for %s', link)
-        # end if
-    # end try
-    return []
-# end def
-
-
-def process_results(combined_results):
-    combined = dict()
-    for result in combined_results:
-        key = slugify(result.get('title') or '')
-        if len(key) <= 2:
-            continue
-        combined.setdefault(key, [])
-        combined[key].append(result)
-    # end for
-
-    processed = []
-    for key, value in combined.items():
-        value.sort(key=lambda x: x['url'])
-        processed.append({
-            'id': key,
-            'title': value[0]['title'],
-            'novels': value
-        })
-    # end for
-
-    processed.sort(key=lambda x: -len(x['novels']))
-
-    return processed[:15]  # Control the number of results
-# end def
+            logging.exception("<!> Search Failed! << %s >>", link)
+        return []
+    finally:
+        app.progress += 1
 
 
 def search_novels(app):
@@ -75,59 +53,59 @@ def search_novels(app):
     sources = app.crawler_links.copy()
     random.shuffle(sources)
 
-    bar = tqdm(desc='Searching', total=len(sources), unit='source')
-    if os.getenv('debug_mode') == 'yes':
-        bar.update = lambda n=1: None  # Hide in debug mode
-    # end if
-    bar.clear()
-    
-
     # Add future tasks
-    checked = {}
-    futures_to_check = []
+    checked = set()
     app.progress = 0
+    futures: List[Future] = []
     for link in sources:
         crawler = crawler_list[link]
         if crawler in checked:
-            logger.info('A crawler for "%s" already exists', link)
-            bar.update()
             continue
-        # end if
-        checked[crawler] = True
-        future = executor.submit(get_search_result, app, link, bar)
-        futures_to_check.append(future)
-    # end for
+        checked.add(crawler)
+        f = taskman.submit_task(_perform_search, app, link)
+        futures.append(f)
 
     # Resolve all futures
-    combined_results = []
-    for i, f in enumerate(futures_to_check):
-        assert isinstance(f, futures.Future)
-        try:
-            f.result(SEARCH_TIMEOUT)
-        except KeyboardInterrupt:
-            break
-        except TimeoutError:
-            f.cancel()
-        except Exception as e:
-            logger.debug('Failed to complete search', e)
-        finally:
-            app.progress += 1
-            bar.update()
-        # end try
-    # end for
+    try:
+        taskman.resolve_futures(
+            futures,
+            desc="Searching",
+            unit="source",
+            timeout=SEARCH_TIMEOUT,
+        )
+    except Exception:
+        if logger.isEnabledFor(logging.DEBUG):
+            logging.exception("<!> Search Failed!")
 
-    # Cancel any remaining futures
-    for f in futures_to_check:
-        assert isinstance(f, futures.Future)
-        if not f.done():
-            f.cancel()
-        elif not f.cancelled():
-            combined_results += f.result()
-        # end if
-    # end for
+    # Combine the search results
+    combined: Dict[str, List[SearchResult]] = {}
+    for f in futures:
+        if not f or not f.done() or f.cancelled():
+            continue
+        for item in f.result() or []:
+            if not (item and item.title):
+                continue
+            key = slugify(str(item.title))
+            if len(key) <= 2:
+                continue
+            combined.setdefault(key, [])
+            combined[key].append(item)
 
     # Process combined search results
-    app.search_results = process_results(combined_results)
-    print('Found %d results' % len(app.search_results))
-    bar.close()
-# end def
+    processed: List[CombinedSearchResult] = []
+    for key, value in combined.items():
+        value.sort(key=lambda x: x.url)
+        processed.append(
+            CombinedSearchResult(
+                id=key,
+                title=value[0].title,
+                novels=value,
+            )
+        )
+    processed.sort(
+        key=lambda x: (
+            -len(x.novels),
+            -difflib.SequenceMatcher(None, x.title, app.user_input).ratio(),
+        )
+    )
+    app.search_results = processed[:MAX_RESULTS]

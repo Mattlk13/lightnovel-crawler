@@ -1,111 +1,139 @@
 # -*- coding: utf-8 -*-
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import re
+import json
+from typing import Generator
 
-import js2py
-from bs4.element import Tag
+from bs4 import BeautifulSoup, Tag
 
-from lncrawl.core.crawler import Crawler
+from lncrawl.models import Chapter, SearchResult
+from lncrawl.templates.browser.searchable import SearchableBrowserTemplate
+
+from urllib.parse import urljoin, quote_plus
 
 logger = logging.getLogger(__name__)
 
 
-class RanobeLibCrawler(Crawler):
+digit_regex = re.compile(r"\/(\d+)-")
+
+
+class RanobeLibCrawler(SearchableBrowserTemplate):
     base_url = [
-        'http://ranobes.net/',
-        'https://ranobes.net/',
+        "https://ranobes.top/",
+        "https://ranobes.net/",
     ]
 
     def initialize(self) -> None:
-        self.executor = ThreadPoolExecutor(max_workers=1)
-    # end def
+        self.cleaner.bad_css.update([".free-support", 'div[id^="adfox_"]'])
 
-    def read_novel_info(self):
-        logger.info('Visiting %s', self.novel_url)
-        soup = self.get_soup(self.novel_url)
+    def select_search_items_in_browser(self, query: str) -> Generator[Tag, None, None]:
+        self.visit(urljoin(self.home_url, "/search/{}/".format(quote_plus(query))))
+        self.browser.wait(".breadcrumbs-panel")
+        for elem in self.browser.select(".short-cont .title a"):
+            yield elem
 
-        main_page_link = soup.select_one('#mainside, .breadcrumbs-panel')
-        if isinstance(main_page_link, Tag):
-            main_page_link = main_page_link.select_one('a[href*="/novels/"]')
-            if isinstance(main_page_link, Tag):
-                self.novel_url = self.absolute_url(main_page_link['href'])
-                logger.info('Visiting %s', self.novel_url)
-                soup = self.get_soup(self.novel_url)
+    def select_search_items(self, query: str) -> Generator[Tag, None, None]:
+        soup = self.get_soup(
+            urljoin(self.home_url, "/search/{}/".format(quote_plus(query)))
+        )
 
-        possible_title = soup.select_one('meta[property="og:title"]')
-        assert isinstance(possible_title, Tag)
-        self.novel_title = possible_title['content']
-        logger.info('Novel title: %s', self.novel_title)
+        for elem in soup.select(".short-cont .title a"):
+            yield elem
 
-        possible_cover = soup.select_one('meta[property="og:image"]')
-        if isinstance(possible_cover, Tag):
-            self.novel_cover = self.absolute_url(possible_cover['content'])
-        logger.info('Novel cover: %s', self.novel_cover)
+    def parse_search_item(self, tag: Tag) -> SearchResult:
+        return SearchResult(
+            title=tag.text.strip(),
+            url=self.absolute_url(tag["href"]),
+        )
 
-        author_link = soup.select_one('.tag_list a[href*="/authors/"]')
-        if isinstance(author_link, Tag):
-            self.novel_author = author_link.text.strip().title()
-        # end if
-        logger.info('Novel author: %s', self.novel_author)
+    def visit_novel_page_in_browser(self) -> BeautifulSoup:
+        self.visit(self.novel_url)
+        self.browser.wait(".body_left_in")
+        self.novel_id = digit_regex.search(self.novel_url).group(1)
 
-        chapter_list_link = soup.select_one('#fs-chapters a[title="Go to table of contents"]')
-        assert isinstance(chapter_list_link, Tag)
-        chapter_list_link = self.absolute_url(chapter_list_link['href'])
+    def parse_title(self, soup: BeautifulSoup) -> str:
+        tag = soup.select_one("h1.title")
+        assert tag
+        return tag.text.strip()
 
-        logger.info('Visiting %s', chapter_list_link)
+    def parse_cover(self, soup: BeautifulSoup) -> str:
+        tag = soup.select_one(".r-fullstory-poster .poster a img")
+        assert tag
+        if tag.has_attr("data-src"):
+            return self.absolute_url(tag["data-src"])
+        if tag.has_attr("src"):
+            return self.absolute_url(tag["src"])
+
+    def parse_authors(self, soup: BeautifulSoup) -> Generator[str, None, None]:
+        for a in soup.select('.tag_list a[href*="/authors/"]'):
+            yield a.text.strip()
+
+    def parse_chapter_list_in_browser(self) -> Generator[Chapter, None, None]:
+        self.browser._driver.implicitly_wait(1)
+        self.browser.click('a[href^="/chapters/"][title="Go to table of contents"]')
+
+        index = 0
+        while True:
+            self.browser.wait(".cat_line a")
+            for tag in self.browser.find_all(".cat_line a"):
+                index += 1
+                yield Chapter(
+                    id=index,
+                    title=tag.get_attribute("title"),
+                    url=self.absolute_url(tag.get_attribute("href")),
+                )
+
+            next_page = self.browser.find(".page_next a")
+            if not next_page:
+                break
+            self.browser._driver.implicitly_wait(1)
+            next_page.scroll_into_view()
+            next_page.click()
+
+    def parse_chapter_list(self, soup: BeautifulSoup) -> Generator[Chapter, None, None]:
+        self.novel_id = digit_regex.search(self.novel_url).group(1)
+        chapter_list_link = urljoin(self.home_url, f"/chapters/{self.novel_id}/")
         soup = self.get_soup(chapter_list_link)
-        
-        script = soup.find(lambda tag: isinstance(tag, Tag) and tag.name == 'script' and tag.text.startswith('window.__DATA__'))
-        assert isinstance(script, Tag)
 
-        data = js2py.eval_js(script.text).to_dict()
-        assert isinstance(data, dict)
-
-        pages_count = data['pages_count']
-        logger.info('Total pages: %d', pages_count)
+        data = self.extract_page_data(soup)
+        pages_count = data["pages_count"]
+        logger.info("Total pages: %d", pages_count)
 
         futures = []
         page_soups = [soup]
         for i in range(2, pages_count + 1):
-            chapter_page_url = chapter_list_link.strip('/') + ('/page/%d' % i)
-            f = self.executor.submit(self.get_soup, chapter_page_url)
-            futures.append(f)
+            chapter_page_url = chapter_list_link.strip("/") + ("/page/%d" % i)
+            futures.append(self.executor.submit(self.get_soup, chapter_page_url))
         page_soups += [f.result() for f in futures]
 
-        volumes = set([])
-        for soup in reversed(page_soups):
-            script = soup.find(lambda tag: isinstance(tag, Tag) and tag.name == 'script' and tag.text.startswith('window.__DATA__'))
-            assert isinstance(script, Tag)
+        index = 0
+        for soup in enumerate(reversed(page_soups)):
+            data = self.extract_page_data(soup)
+            for chapter in reversed(data["chapters"]):
+                index += 1
+                yield Chapter(
+                    id=index,
+                    title=chapter["title"],
+                    url=self.absolute_url(chapter["link"]),
+                )
 
-            data = js2py.eval_js(script.text).to_dict()
-            assert isinstance(data, dict)
+    def visit_chapter_page_in_browser(self, chapter: Chapter) -> None:
+        self.visit(chapter.url)
+        self.browser.wait("#arrticle")
 
-            for chapter in reversed(data['chapters']):
-                chap_id = len(self.chapters) + 1
-                vol_id = len(self.chapters) // 100 + 1
-                volumes.add(vol_id)
-                self.chapters.append({
-                    'id': chap_id,
-                    'volume': vol_id,
-                    'title': chapter['title'],
-                    'url': 'https://ranobes.net/read-%s.html' % chapter['id'],
-                })
+    def select_chapter_body(self, soup: BeautifulSoup) -> Tag:
+        return soup.select_one("div#arrticle")
 
-        self.volumes = [{'id': x} for x in volumes]
-    # end def
+    def extract_page_data(self, soup: BeautifulSoup) -> dict:
+        script = soup.find(
+            lambda tag: isinstance(tag, Tag)
+            and tag.name == "script"
+            and tag.text.startswith("window.__DATA__")
+        )
+        assert isinstance(script, Tag)
 
-    def download_chapter_body(self, chapter):
-        logger.info('Downloading %s', chapter['url'])
-        soup = self.get_soup(chapter['url'])
+        content = script.text.strip()
+        content = content.replace("window.__DATA__ = ", "")
 
-        article = soup.select_one('.text[itemprop="description"]')
-
-        self.bad_css += [
-            '.free-support',
-            'div[id^="adfox_"]'
-        ]
-        self.clean_contents(article)
-
-        return str(article)
-    # end def
-# end class
+        data = json.loads(content)
+        return data

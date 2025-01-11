@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-import json
+
 import logging
-import re
 
 from lncrawl.core.crawler import Crawler
 
@@ -15,7 +14,6 @@ class Miraslation(Crawler):
     ]
 
     def read_novel_info(self):
-        '''Get novel title, autor, cover etc'''
         logger.debug('Visiting %s', self.novel_url)
         soup = self.get_soup(self.novel_url)
 
@@ -38,41 +36,26 @@ class Miraslation(Crawler):
 
         for a in chapters:
             chap_id = len(self.chapters) + 1
-            if len(self.chapters) % 100 == 0:
-                vol_id = chap_id//100 + 1
-                vol_title = 'Volume ' + str(vol_id)
-                self.volumes.append({
-                    'id': vol_id,
-                    'title': vol_title,
-                })
-            # end if
+            vol_id = 1 + len(self.chapters) // 100
+            if len(self.volumes) < vol_id:
+                self.volumes.append({'id': vol_id})
+
             self.chapters.append({
                 'id': chap_id,
                 'volume': vol_id,
-                'url':  self.absolute_url(a['href']),
+                'url': self.absolute_url(a['href']),
                 'title': a.text.strip() or ('Chapter %d' % chap_id),
             })
-        # end for
-    # end def
 
     def download_chapter_body(self, chapter):
-        '''Download body of a single chapter and return as clean html format.'''
-        logger.info('Downloading %s', chapter['url'])
         soup = self.get_soup(chapter['url'])
 
         body_parts = soup.select_one('.entry-content')
+        assert body_parts, 'No chapter body'
 
         for content in body_parts.select("p"):
             for bad in ["Table of Contents", "Previous Chapter", "Next Chapter", " | "]:
                 if bad in content.text:
                     content.extract()
 
-        
-
-        # Remove Share Button from bottom of chapter
-        for share in body_parts.select('div.code-block'):
-            share.extract()
-
-        return self.extract_contents(body_parts)
-    # end def
-# end class
+        return self.cleaner.extract_contents(body_parts)

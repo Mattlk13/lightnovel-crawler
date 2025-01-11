@@ -1,277 +1,224 @@
-# -*- coding: utf-8 -*-
 """
 To download chapter bodies
 """
-import base64
-import hashlib
+
 import json
 import logging
-import os
-import time
-from io import BytesIO
+from pathlib import Path
 
-from PIL import Image
-from tqdm import tqdm
-
-from ..core.exeptions import LNException
+from ..models.chapter import Chapter
+from ..utils.imgen import generate_cover_image
 from .arguments import get_args
 
 logger = logging.getLogger(__name__)
 
-def download_image(app, url) -> Image.Image:
-    '''Download image'''
-    assert isinstance(url, str)
-    if len(url) > 1000 or url.startswith('data:'):
-        content = base64.b64decode(url.split('base64,')[-1])
-    else:
-        content = app.crawler.download_image(url)
-    # end if
-    return Image.open(BytesIO(content))
-# end def
 
-def download_cover(app):
-    filename = None
-    filename = os.path.join(app.output_path, 'cover.jpg')
-    if os.path.exists(filename):
-        return filename
+def _chapter_file(
+    chapter: Chapter,
+    output_path: str,
+    pack_by_volume: bool,
+):
+    dir_name = Path(output_path) / "json"
+    if pack_by_volume:
+        vol_name = "Volume " + str(chapter.volume).rjust(2, "0")
+        dir_name = dir_name / vol_name
 
-    logger.info('Downloading original cover image...')
-    image_url = app.crawler.novel_cover
-    try:
-        img = download_image(app, image_url)
-        img.convert('RGB').save(filename, "JPEG")
-        logger.debug('Saved cover: %s', filename)
-        return filename
-    except KeyboardInterrupt as ex:
-        raise LNException('Cancelled by user')
-    except Exception as ex:
-        logger.warn('Failed to download original cover image: %s -> %s (%s)',
-                    image_url, filename, str(ex))
-    # end try
-
-    logger.info('Downloading fallback cover image...')
-    image_url = 'https://source.unsplash.com/featured/800x1032?abstract'
-    try:
-        img = download_image(app, image_url)
-        img.convert('RGB').save(filename, "JPEG")
-        logger.debug('Saved cover: %s', filename)
-        return filename
-    except KeyboardInterrupt as ex:
-        raise LNException('Cancelled by user')
-    except Exception as ex:
-        logger.warn('Failed to download fallback cover image: %s -> %s (%s)',
-                    image_url, filename, str(ex))
-    # end try
-    return None
-# end def
+    chapter_name = str(chapter.id).rjust(5, "0")
+    json_file = dir_name / (chapter_name + ".json")
+    return json_file
 
 
-def download_chapter_body(app, chapter):
-    result = None
-    chapter['body'] = read_chapter_body(app, chapter)
+def _save_chapter(app, chapter: Chapter):
+    from .app import App
 
-    if not chapter['body']:
-        retry_count = 3
-        chapter['body'] = ''
-        for i in range(retry_count):
-            try:
-                logger.debug('Downloading chapter %d: %s', chapter['id'], chapter['url'])
-                chapter['body'] = app.crawler.download_chapter_body(chapter)
-                break
-            except KeyboardInterrupt as ex:
-                raise LNException('Cancelled by user')
-            except Exception as e:
-                if i == retry_count:
-                    logger.exception('Failed to download chapter body')
-                else:
-                    logger.debug('Error: %s. Retrying...', str(e))
-                    time.sleep(3 + 5 * i)  # wait before next retry
-                # end if
-            # end try
-        # end for
-    # end if
+    assert isinstance(app, App)
 
-    if not chapter['body']:
-        result = 'Body is empty: ' + chapter['url']
-    else:
-        save_chapter_body(app, chapter)
-    # end if
+    if not chapter.body:
+        chapter.body = "<p><i>Failed to download chapter body</i></p>"
 
-    app.progress += 1
-    return result
-# end def
+    args = get_args()
+    source_notice = (
+        f'<br><p><small>Source: <a href="{chapter.url}">{chapter.url}</a></small></p>'
+    )
+    if args.add_source_url and not chapter.body.endswith(source_notice):
+        chapter.body += source_notice
+
+    title = chapter.title
+    title = "&lt;".join(title.split("<"))
+    title = "&gt;".join(title.split(">"))
+    title = f"<h1>{title}</h1>"
+    if not chapter.body.startswith(title):
+        chapter.body = "".join([title, chapter.body])
+
+    file_name = _chapter_file(
+        chapter,
+        output_path=app.output_path,
+        pack_by_volume=app.pack_by_volume,
+    )
+    file_name.parent.mkdir(parents=True, exist_ok=True)
+    with file_name.open("w", encoding="utf-8") as fp:
+        json.dump(chapter, fp, ensure_ascii=False)
 
 
-def get_chapter_filename(app, chapter):
-    dir_name = os.path.join(app.output_path, 'json')
-    if app.pack_by_volume:
-        vol_name = 'Volume ' + str(chapter['volume']).rjust(2, '0')
-        dir_name = os.path.join(dir_name, vol_name)
-    # end if
+def fetch_chapter_body(app):
+    from .app import App
 
-    chapter_name = str(chapter['id']).rjust(5, '0')
-    return os.path.join(dir_name, chapter_name + '.json')
-# end def
-
-
-def read_chapter_body(app, chapter):
-    file_name = get_chapter_filename(app, chapter)
-
-    chapter['body'] = ''
-    if os.path.exists(file_name):
-        logger.debug('Restoring from %s', file_name)
-        with open(file_name, 'r', encoding="utf-8") as file:
-            old_chapter = json.load(file)
-            chapter['body'] = old_chapter['body']
-        # end with
-    # end if
-
-    return chapter['body']
-# end def
-
-
-def save_chapter_body(app, chapter):
-    file_name = get_chapter_filename(app, chapter)
-
-    title = chapter['title'].replace('>', '&gt;').replace('<', '&lt;')
-    if title not in chapter['body']:
-        chapter['body'] = '<h1>%s</h1>\n%s' % (title, chapter['body'])
-    if get_args().add_source_url and chapter['url'] not in chapter['body']:
-        chapter['body'] += '<br><p>Source: <a href="%s">%s</a></p>' % (
-            chapter['url'], chapter['url'])
-    # end if
-
-    os.makedirs(os.path.dirname(file_name), exist_ok=True)
-    with open(file_name, 'w', encoding="utf-8") as file:
-        file.write(json.dumps(chapter, ensure_ascii=False))
-    # end with
-# end def
-
-
-def download_content_image(app, url, filename):
-    image_folder = os.path.join(app.output_path, 'images')
-    image_file = os.path.join(image_folder, filename)
-    try:
-        if os.path.isfile(image_file):
-            return filename
-        # end if
-
-        img = download_image(app, url)
-        os.makedirs(image_folder, exist_ok=True)
-        with open(image_file, 'wb') as f:
-            img.convert('RGB').save(f, "JPEG")
-            logger.debug('Saved image: %s', image_file)
-        # end with
-        return filename
-    except KeyboardInterrupt as ex:
-        raise LNException('Cancelled by user')
-    except Exception as ex:
-        logger.debug('Failed to download image: %s (%s)', image_file, str(ex))
-        return None
-    finally:
-        app.progress += 1
-    # end try
-# end def
-
-def download_chapters(app):
-    app.progress = 0
-    bar = tqdm(desc='Downloading', total=len(app.chapters), unit='ch')
-    if os.getenv('debug_mode') == 'yes':
-        bar.update = lambda n=1: None  # Hide in debug mode
-    # end if
-    bar.clear()
+    assert isinstance(app, App)
+    assert app.crawler is not None
 
     if not app.output_formats:
         app.output_formats = {}
-    # end if
 
-    futures_to_check = [
-        app.crawler.executor.submit(
-            download_chapter_body,
-            app,
+    # attempt to restore from file cache
+    for chapter in app.chapters:
+        file_name = _chapter_file(
             chapter,
+            pack_by_volume=app.pack_by_volume,
+            output_path=app.output_path,
         )
-        for chapter in app.chapters
-    ]
+        try:
+            with open(file_name, "r", encoding="utf-8") as file:
+                old_chapter = json.load(file)
+                chapter.update(**old_chapter)
+                if chapter.success:
+                    logger.info(f"Restored chapter {chapter.id} from {file_name}")
+        except FileNotFoundError:
+            pass
+        except json.JSONDecodeError:
+            logger.debug("Unable to decode JSON from the file: %s" % file_name)
+        except Exception as e:
+            logger.exception("An error occurred while reading the file:", e)
 
-    for future in futures_to_check:
-        result = future.result()
-        if result:
-            bar.clear()
-            logger.error(result)
-        # end if
-        bar.update()
-    # end for
-
-    bar.close()
-    print('Processed %d chapters' % len(app.chapters))
-# end def
-
-
-def download_chapter_images(app):
+    # download remaining chapters
     app.progress = 0
+    for progress in app.crawler.download_chapters(app.chapters):
+        app.progress += progress
+
+    for chapter in app.chapters:
+        _save_chapter(app, chapter)
+
+    logger.info(f"Processed {len(app.chapters)} chapters [{app.progress} fetched]")
+
+
+def _fetch_content_image(app, url, image_file: Path):
+    from .app import App
+
+    assert isinstance(app, App)
+
+    if url and not (image_file.exists() and image_file.is_file()):
+        try:
+            img = app.crawler.download_image(url)
+            image_file.parent.mkdir(parents=True, exist_ok=True)
+            if img.mode not in ("L", "RGB", "YCbCr", "RGBX"):
+                if img.mode == "RGBa":
+                    # RGBa -> RGB isn't supported so we go through RGBA first
+                    img.convert("RGBA").convert("RGB")
+                else:
+                    img = img.convert("RGB")
+            img.save(image_file.as_posix(), "JPEG", optimized=True)
+            img.close()
+            logger.debug("Saved image: %s", image_file)
+        finally:
+            app.progress += 1
+
+
+def _fetch_cover_image(app):
+    from .app import App
+
+    assert isinstance(app, App)
+    assert app.crawler is not None
+
+    filename = "cover.jpg"
+    cover_file = Path(app.output_path) / filename
+    if app.crawler.novel_cover:
+        try:
+            _fetch_content_image(
+                app,
+                app.crawler.novel_cover,
+                cover_file,
+            )
+        except Exception as e:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.exception("Failed to download cover", e)
+
+    if not cover_file.is_file():
+        generate_cover_image(cover_file.as_posix())
+
+    app.progress += 1
+    app.book_cover = cover_file
+    assert Path(app.book_cover).is_file(), "Failed to download or generate cover image"
+
+
+def _discard_failed_images(app, chapter, failed):
+    from .app import App
+
+    assert isinstance(app, App)
+    assert app.crawler is not None
+    assert isinstance(chapter, dict), "Invalid chapter"
+
+    if not chapter["body"] or "images" not in chapter:
+        return
+
+    assert isinstance(chapter["images"], dict)
+    current_failed = [filename for filename in failed if filename in chapter["images"]]
+    if not current_failed:
+        return
+
+    soup = app.crawler.make_soup(chapter["body"])
+    for filename in current_failed:
+        chapter["images"].pop(filename)
+        for img in soup.select(f'img[alt="{filename}"]'):
+            img.extract()
+
+    soup_body = soup.select_one("body")
+    assert soup_body
+    chapter["body"] = "".join([str(x) for x in soup_body.contents])
+
+
+def fetch_chapter_images(app):
+    from .app import App
+
+    assert isinstance(app, App)
+    assert app.crawler is not None
 
     # download or generate cover
-    app.book_cover = download_cover(app)
-    if not app.book_cover:
-        logger.warn('No cover image')
-    # end if
+    app.progress = 0
+    futures = [
+        app.crawler.executor.submit(
+            _fetch_cover_image,
+            app,
+        )
+    ]
 
-    image_count = 0
-    futures_to_check = {}
+    # download content images
+    image_folder = Path(app.output_path) / "images"
+    images_to_download = set(
+        [
+            (filename, url)
+            for chapter in app.chapters
+            for filename, url in chapter.get("images", {}).items()
+        ]
+    )
+    futures += [
+        app.crawler.executor.submit(
+            _fetch_content_image,
+            app,
+            url,
+            image_folder / filename,
+        )
+        for filename, url in images_to_download
+    ]
+
+    failed = []
+    try:
+        app.crawler.resolve_futures(futures, desc="  Images", unit="item")
+        failed = [
+            filename
+            for filename, url in images_to_download
+            if not (image_folder / filename).is_file()
+        ]
+    finally:
+        logger.info("Processed %d images [%d failed]" % (app.progress, len(failed)))
+
     for chapter in app.chapters:
-        if not chapter.get('body'):
-            continue
-        # end if
-
-        soup = app.crawler.make_soup(chapter['body'])
-        for img in soup.select('img'):
-            full_url = app.crawler.absolute_url(img['src'], page_url=chapter['url'])
-            filename = hashlib.md5(img['src'].encode()).hexdigest() + '.jpg'
-            future = app.crawler.executor.submit(download_content_image, app, full_url, filename)
-            futures_to_check.setdefault(chapter['id'], [])
-            futures_to_check[chapter['id']].append(future)
-            image_count += 1
-        # end for
-    # end for
-
-    if image_count == 0:
-        return
-    # end if
-
-    bar = tqdm(desc='Images', total=image_count, unit='img')
-    if os.getenv('debug_mode') == 'yes':
-        bar.update = lambda n=1: None  # Hide in debug mode
-    # end if
-    bar.clear()
-
-    for chapter in app.chapters:
-        if chapter['id'] not in futures_to_check:
-            continue
-        # end if
-
-        images = []
-        for future in futures_to_check[chapter['id']]:
-            images.append(future.result())
-            bar.update()
-        # end for
-        logger.debug(images)
-
-        soup = app.crawler.make_soup(chapter['body'])
-        for img in soup.select('img'):
-            filename = hashlib.md5(img['src'].encode()).hexdigest() + '.jpg'
-            if filename in images:
-                img.attrs = {'src': 'images/%s' % filename, 'alt': filename}
-                # img['style'] = 'float: left; margin: 15px; width: 100%;'
-            else:
-                img.extract()
-            # end if
-        # end for
-
-        chapter['body'] = ''.join([str(x) for x in soup.select_one('body').contents])
-        save_chapter_body(app, chapter)
-    # end for
-
-    bar.close()
-    print('Processed %d images' % image_count)
-# end def
+        _discard_failed_images(app, chapter, failed)
