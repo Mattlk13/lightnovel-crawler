@@ -1,14 +1,15 @@
 """
 https://stackoverflow.com/a/15445989/1583052
 """
-import warnings
+
 import contextlib
+import warnings
 
 import requests
 from urllib3.exceptions import InsecureRequestWarning
 
-
 old_merge_environment_settings = requests.Session.merge_environment_settings
+
 
 @contextlib.contextmanager
 def no_ssl_verification():
@@ -21,21 +22,21 @@ def no_ssl_verification():
         opened_adapters.add(self.get_adapter(url))
 
         settings = old_merge_environment_settings(self, url, proxies, stream, verify, cert)
-        settings['verify'] = False
+        settings["verify"] = False
 
         return settings
 
-    requests.Session.merge_environment_settings = merge_environment_settings
+    requests.Session.merge_environment_settings = merge_environment_settings  # type: ignore
 
     try:
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', InsecureRequestWarning)
+            warnings.simplefilter("ignore", InsecureRequestWarning)
             yield
     finally:
-        requests.Session.merge_environment_settings = old_merge_environment_settings
+        requests.Session.merge_environment_settings = old_merge_environment_settings  # type: ignore
 
         for adapter in opened_adapters:
             try:
                 adapter.close()
-            except:
+            except Exception:
                 pass

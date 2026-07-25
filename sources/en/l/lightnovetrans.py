@@ -1,57 +1,25 @@
 # -*- coding: utf-8 -*-
-import logging
-from lncrawl.core.crawler import Crawler
-
-logger = logging.getLogger(__name__)
+from lncrawl.core import Novel, PageSoup, SoupTemplate
 
 
-class LNTCrawler(Crawler):
-    base_url = 'https://lightnovelstranslations.com/'
+class LNTCrawler(SoupTemplate):
+    base_url = ["https://lightnovelstranslations.com/"]
 
-    def read_novel_info(self):
-        '''Get novel title, autor, cover etc'''
-        logger.debug('Visiting %s', self.novel_url)
+    has_manga = False
+    has_mtl = False
 
-        soup = self.get_soup(self.novel_url)
+    chapter_title_selector = ".novel_title"
+    novel_cover_selector = ".novel-image img"
+    novel_author_selector = ".entry-content > p"
+    chapter_list_selector = ".novel_list_chapter_content li.unlock a"
+    chapter_body_selector = ".text_story"
 
-        self.novel_title = soup.select_one('h1.entry-title').text
-        logger.info('Novel title: %s', self.novel_title)
+    def build_novel_url(self, novel: Novel) -> str:
+        return f"{novel.url.rstrip('/')}/?tab=table_contents"
 
-        # TODO: No covers on site, could not grab author name.
-
-        # Extract volume-wise chapter entries
-        for div in soup.select('.su-accordion .su-spoiler'):
-            vol = div.select_one('.su-spoiler-title').text.strip()
-            vol_id = int(vol) if vol.isdigit() else len(self.volumes) + 1
-            self.volumes.append({
-                'id': vol_id,
-                'title': vol,
-            })
-            for a in div.select('.su-spoiler-content p a'):
-                if not a.has_attr('href'):
-                    continue
-                self.chapters.append({
-                    'id': len(self.chapters) + 1,
-                    'volume': vol_id,
-                    'title': a.text.strip(),
-                    'url': self.absolute_url(a['href']),
-                })
-            # end for
-        # end for
-    # end def
-
-    def download_chapter_body(self, chapter):
-        logger.info('Visiting: %s', chapter['url'])
-        soup = self.get_soup(chapter['url'])
-
-        content = soup.select_one('.entry-content')
-        for bad in content.select('.alignleft, .alignright, hr, p[style*="text-align: center"]'):
-            bad.extract()
-        # end for
-
-        return '\n'.join([str(p) for p in content.find_all('p')])
-
-    # end def
-
-
-# end class
+    def parse_author(self, soup: PageSoup, novel: Novel) -> None:
+        authors = []
+        for p in soup.select(self.novel_author_selector):
+            if "Author" in p.text:
+                authors.append(p.text.replace("Author:", "").strip())
+        novel.author = ", ".join(authors)

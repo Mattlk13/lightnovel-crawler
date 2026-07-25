@@ -1,77 +1,138 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python
 import os
-import re
-import shutil
 from pathlib import Path
+import shutil
+import sys
 
-from PyInstaller import __main__ as pyi
+if sys.version_info[:2] < (3, 9):
+    raise RuntimeError("This app only supports Python 3.9 and later.")
 
-ROOT = Path(__file__).parent
-site_packages = list(ROOT.glob('venv/**/site-packages'))[0]
+IS_WINDOWS = sys.platform == "win32"
+
+ROOT = Path(__file__).resolve().parent
+
+# Determine venv directory: use VIRTUAL_ENV if set, otherwise detect based on OS
+VENV_DIR = os.getenv("VIRTUAL_ENV")
+if VENV_DIR:
+    VENV_DIR = Path(VENV_DIR).relative_to(ROOT).as_posix()
+elif (ROOT / ".venv-win").exists():
+    VENV_DIR = ".venv-win"
+elif (ROOT / ".venv-posix").exists():
+    VENV_DIR = ".venv-posix"
+else:
+    VENV_DIR = ".venv"
+AVAILABLE_SITE_PACKAGES = list(ROOT.glob(f"{VENV_DIR}/**/site-packages"))
+if not AVAILABLE_SITE_PACKAGES:
+    raise RuntimeError(f"No site-packages found in {VENV_DIR}")
+
+SITE_PACKAGES = AVAILABLE_SITE_PACKAGES[0]
+DIST_DIR = ROOT / "dist"
+SPEC_DIR = ROOT / "windows"
+BUILD_DIR = SPEC_DIR / "build"
 
 
 def build_command():
     command = [
-        ROOT / 'lncrawl' / '__main__.py',
-        '--onefile',
-        '--clean',
-        '--noconfirm',
-        '--name', 'lncrawl',
-        '--icon',  ROOT / 'res' / 'lncrawl.ico',
-        '--distpath', ROOT / 'dist',
-        '--specpath', ROOT / 'windows',
-        '--workpath', ROOT / 'windows' / 'build',
+        str(ROOT / "lncrawl" / "__main__.py"),
+        "--onedir" if IS_WINDOWS else "--onefile",
+        "--clean",
+        "--noconfirm",
+        "--name=lncrawl",
+        f"--icon={ROOT / 'res' / 'lncrawl.ico'}",
+        f"--distpath={DIST_DIR}",
+        f"--specpath={SPEC_DIR}",
+        f"--workpath={BUILD_DIR}",
     ]
+    command += gather_packages()
     command += gather_data_files()
     command += gather_hidden_imports()
+    command += gather_excluded_modules()
+    return command
 
-    return [str(x) for x in command]
+
+def gather_packages():
+    packages = [
+        "pylsp",
+    ]
+    return [f"--collect-all={pkg}" for pkg in packages]
 
 
 def gather_data_files():
     file_map = {
-        ROOT / 'lncrawl': 'lncrawl',
-        ROOT / 'sources': 'sources',
-        site_packages / 'cloudscraper': 'cloudscraper',
-        site_packages / 'wcwidth/version.json': 'wcwidth',
-        site_packages / 'text_unidecode/data.bin': 'text_unidecode',
+        ROOT / "pyproject.toml": ".",
+        ROOT / "lncrawl": "lncrawl",
+        ROOT / "sources": "sources",
+        SITE_PACKAGES / "wcwidth" / "version.json": "wcwidth",
+        SITE_PACKAGES / "text_unidecode" / "data.bin": "text_unidecode",
     }
 
-    command = []
+    results = []
     for src, dst in file_map.items():
-        command += ['--add-data', src.as_posix() + os.pathsep + dst]
-
-    return command
+        if src.exists():
+            results.extend(["--add-data", f"{src.as_posix()}:{dst}"])
+    return results
 
 
 def gather_hidden_imports():
-    module_list = [
-        'pkg_resources.py2_warn',
+    hidden = [
+        "passlib.handlers.argon2",
     ]
 
-    for f in (ROOT / 'sources').glob('**/*.py'):
-        rel_path = str(f.relative_to(ROOT / 'sources'))
+    for py_file in (ROOT / "sources").rglob("*.py"):
+        rel_path = str(py_file.relative_to(ROOT / "sources"))
         if all(x[0].isalnum() for x in rel_path.split(os.sep)):
-            module_list.append('sources.' + rel_path[:-3].replace(os.sep, '.'))
+            module = "sources." + rel_path[:-3].replace(os.sep, ".")
+            hidden.append(module)
 
-    command = []
-    for p in module_list:
-        command += ['--hidden-import', p]
+    return [f"--hidden-import={module}" for module in hidden]
 
-    return command
-# end def
+
+def gather_excluded_modules():
+    exclude = [
+        "pip",
+        "wheel",
+        "ujson",
+        "altgraph",
+        "macholib",
+        "pyinstaller",
+        "pkg_resources",
+        "pyinstaller-hooks-contrib",
+    ]
+    return [flag for mod in exclude for flag in ["--exclude-module", mod]]
 
 
 def package():
-    output = str(ROOT / 'windows')
-    shutil.rmtree(output, ignore_errors=True)
-    os.makedirs(output, exist_ok=True)
-    pyi.run(build_command())
-    shutil.rmtree(output, ignore_errors=True)
-# end def
+    command = build_command()
+
+    print("🔧 Running PyInstaller:")
+    print(" ".join(command))
+    print("-" * 60)
+
+    # Cleanup only build artifacts inside the spec dir, not the whole directory
+    # (installer.iss and other files in windows/ must be preserved)
+    shutil.rmtree(BUILD_DIR, ignore_errors=True)
+    for spec_file in SPEC_DIR.glob("*.spec"):
+        spec_file.unlink(missing_ok=True)
+    SPEC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Run PyInstaller
+    from PyInstaller import __main__ as pyi  # type: ignore
+
+    pyi.run(command)
+
+    # Cleanup temp build dir
+    shutil.rmtree(BUILD_DIR, ignore_errors=True)
+
+    # Final output confirmation
+    OUTPUT_WIN = DIST_DIR / "lncrawl" / "lncrawl.exe"  # onedir (Windows)
+    OUTPUT_POSIX = DIST_DIR / "lncrawl"  # onefile (Mac/Linux)
+    if OUTPUT_WIN.is_file():
+        print(f"✅ Executable created: {OUTPUT_WIN}")
+    elif OUTPUT_POSIX.is_file():
+        print(f"✅ Executable created: {OUTPUT_POSIX}")
+    else:
+        print("❌ Build failed: Output not found.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     package()
-# end if

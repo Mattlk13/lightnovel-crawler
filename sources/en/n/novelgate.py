@@ -1,95 +1,67 @@
 # -*- coding: utf-8 -*-
-import json
 import logging
 import re
-from lncrawl.core.crawler import Crawler
+
+from lncrawl.core import Chapter, Novel, PageSoup, SearchResult, SoupTemplate
 
 logger = logging.getLogger(__name__)
-search_url = 'https://novelgate.net/search/%s'
 
-class NovelGate(Crawler):
-    base_url = 'https://novelgate.net/'
 
-    def search_novel(self, query):
-        query = query.lower().replace(' ', '%20')
-        soup = self.get_soup(search_url % query)
+class NovelGate(SoupTemplate):
+    can_search = True
+    base_url = [
+        "https://novelgate.net/",
+        "https://home.novel-gate.com/",
+    ]
 
-        results = []
-        for tab in soup.select('.film-item'):
-            a = tab.select_one('a')
-            latest = tab.select_one('label.current-status span.process').text
-            results.append({
-                'title': a['title'],
-                'url': self.absolute_url(a['href']),
-                'info': '%s' % (latest),
-            })
-        # end for
+    chapter_body_selector = "#chapter-body"
 
-        return results
-    # end def
+    def search(self, query: str):
+        query = query.lower().replace(" ", "%20")
+        soup = self.scraper.get_soup(f"{self.scraper.origin}search/{query}")
+        for tab in soup.select(".film-item"):
+            a = tab.select_one("a")
+            if not a:
+                continue
+            latest = tab.select_one("label.current-status span.process").text
+            yield SearchResult(
+                title=a["title"],
+                url=self.absolute_url(a["href"]),
+                info=latest,
+            )
 
-    def read_novel_info(self):
-        '''Get novel title, autor, cover etc'''
-        logger.debug('Visiting %s', self.novel_url)
-        soup = self.get_soup(self.novel_url)
+    def parse_title(self, soup: PageSoup, novel: Novel) -> None:
+        possible_title = soup.select_one(".name")
+        novel.title = possible_title.text
 
-        self.novel_title = soup.select_one('.name').text
-        logger.info('Novel title: %s', self.novel_title)
+    def parse_authors(self, soup: PageSoup, novel: Novel) -> None:
+        novel.author = ", ".join([a.text for a in soup.select('a[href*="/author/"]')])
 
-        author = soup.find_all(href=re.compile('author'))
-        if len(author) == 2:
-            self.novel_author = author[0].text + ' (' + author[1].text + ')'
-        else:
-            self.novel_author = author[0].text
-        logger.info('Novel author: %s', self.novel_author)
+    def parse_cover(self, soup: PageSoup, novel: Novel) -> None:
+        img = soup.select_one(".book-cover")
+        if img and img.get("data-original"):
+            novel.cover_url = self.absolute_url(img["data-original"])
 
-        self.novel_cover = self.absolute_url(
-            soup.select_one('.book-cover')['data-original'])
-        logger.info('Novel cover: %s', self.novel_cover)
+    def parse_toc(self, soup: PageSoup, novel: Novel) -> None:
+        for div in soup.select(".block-film #list-chapters .book"):
+            vol_title = div.select_one(".title a").text
+            if not vol_title:
+                continue
+            volume = novel.add_volume(title=vol_title)
+            for a in div.select("ul.list-chapters li.col-sm-5 a"):
+                novel.add_chapter(
+                    title=a.text,
+                    volume=volume.id,
+                    url=self.absolute_url(a["href"]),
+                )
 
-        for div in soup.select('.block-film #list-chapters .book'):
-            vol_title = div.select_one('.title a').text
-            vol_id = [int(x) for x in re.findall(r'\d+', vol_title)]
-            vol_id = vol_id[0] if len(vol_id) else len(self.volumes) + 1
-            self.volumes.append({
-                'id': vol_id,
-                'title': vol_title,
-            })
-
-            for a in div.select('ul.list-chapters li.col-sm-5 a'):
-                ch_title = a.text
-                ch_id = [int(x) for x in re.findall(r'\d+', ch_title)]
-                ch_id = ch_id[0] if len(ch_id) else len(self.chapters) + 1
-                self.chapters.append({
-                    'id': ch_id,
-                    'volume': vol_id,
-                    'title': ch_title,
-                    'url':  self.absolute_url(a['href']),
-                })
-            # end for
-        # end for
-
-        logger.debug('%d chapters and %d volumes found',
-                     len(self.chapters), len(self.volumes))
-    # end def
-
-    def download_chapter_body(self, chapter):
-        '''Download body of a single chapter and return as clean html format.'''
-        logger.info('Visiting %s', chapter['url'])
-        soup = self.get_soup(chapter['url'])
-
-        contents = soup.select_one('#chapter-body')
-        # end for
-
-        return str(contents)
-    # end def
+    def parse_chapter_body(self, soup: PageSoup, chapter: Chapter) -> None:
+        chapter.body = str(soup)
 
     def format_text(self, text):
-        '''formats the text and remove bad characters'''
-        text = re.sub(r'\u00ad', '', text, flags=re.UNICODE)
-        text = re.sub(r'\u201e[, ]*', '&ldquo;', text, flags=re.UNICODE)
-        text = re.sub(r'\u201d[, ]*', '&rdquo;', text, flags=re.UNICODE)
-        text = re.sub(r'[ ]*,[ ]+', ', ', text, flags=re.UNICODE)
+        """formats the text and remove bad characters"""
+        text = re.sub(r"\u00ad", "", text, flags=re.UNICODE)
+        text = re.sub(r"\u201e[, ]*", "&ldquo;", text, flags=re.UNICODE)
+        text = re.sub(r"\u201d[, ]*", "&rdquo;", text, flags=re.UNICODE)
+        text = re.sub(r"[ ]*,[ ]+", ", ", text, flags=re.UNICODE)
         return text.strip()
-    # end def
-# end class

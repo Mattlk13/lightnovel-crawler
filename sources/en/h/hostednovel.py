@@ -1,81 +1,76 @@
 # -*- coding: utf-8 -*-
 import logging
 import re
-from bs4 import BeautifulSoup
-from bs4.element import Tag
-from lncrawl.core.crawler import Crawler
+
+from lncrawl.core import Chapter, LegacyCrawler, Volume
 
 logger = logging.getLogger(__name__)
 
 
-class HostedNovelCom(Crawler):
-    base_url = 'https://hostednovel.com/'
+class HostedNovelCom(LegacyCrawler):
+    base_url = "https://hostednovel.com/"
+
+    def extract_number_from_string(self, input_string):
+        return int(re.findall(r"[-+]?\d*\.\d+|\d+", input_string)[0])
 
     def read_novel_info(self):
         soup = self.get_soup(self.novel_url)
 
-        possible_image = soup.select_one('.card-body img.cover-image')
-        assert isinstance(possible_image, Tag)
+        possible_title = soup.select_one(".text-center h1.font-extrabold")
+        self.novel_title = possible_title.text.strip()
 
-        self.novel_title = possible_image['alt']
-        logger.info('Novel title: %s', self.novel_title)
+        details = soup.select_one('section[aria-labelledby="novel-details-heading"]')
+        if details:
+            possible_image = details.select_one("img[src]")
+            if possible_image:
+                self.novel_cover = self.absolute_url(str(possible_image["src"]))
 
-        self.novel_cover = self.absolute_url(possible_image['src'])
-        logger.info('Novel cover: %s', self.novel_cover)
+            self.novel_tags = []
+            for div in details.select("dl.grid div"):
+                dt = div.select_one("dt")
+                dd = div.select_one("dd")
+                if dt and dd:
+                    name = dt.get_text(strip=True).lower()
+                    value = dd.get_text(strip=True)
+                    if "author" in name:
+                        self.novel_author = value
+                    elif "genres" in name:
+                        self.novel_tags.append(value)
+                    elif "status" in name:
+                        self.novel_tags.append(value)
 
-        for p in soup.select('.card-body p'):
-            if 'written by' in p.text.lower():
-                author = re.sub(r'written by:?', '', p.text, flags=re.I + re.M)
-                author = re.sub(r'\([^\u0000-\u007f]+\)', '', author)
-                self.novel_author = author.strip()
-                break
-        # end for
-        logger.info('Novel author: %s', self.novel_author)
+        final_pg = 1
+        final_pg_el = soup.select_one('#chapters nav[aria-label="Pagination"] a:nth-last-child(1)')
+        final_pg_href = final_pg_el and final_pg_el.get("href")
+        if final_pg_href:
+            final_pg = self.extract_number_from_string(str(final_pg_href))
+        logger.info(f"max_page = {final_pg}")
 
-        xsrf_token = self.cookies['XSRF-TOKEN']
+        futures = []
+        raw_novel_url = re.split(r"[?#]", self.novel_url)[0]
+        for page in range(final_pg):
+            page_url = raw_novel_url + f"?page={page + 1}"
+            logger.info('Getting chapters from "%s"', page_url)
+            f = self.executor.submit(self.get_soup, page_url)
+            futures.append(f)
 
-        futures = {}
-        for div in soup.select('.chaptergroups .chaptergroup'):
-            vol_id = 1 + len(self.volumes)
-            possible_title = div.select_one('.card-header h3')
-            if isinstance(possible_title, Tag):
-                vol_title = possible_title.text
-            else:
-                vol_title = f'Volume {vol_id}'
-            # end if
-            self.volumes.append({
-                'id': vol_id,
-                'title': vol_title
-            })
-
-            data_id = str(div['data-id'])
-            url = self.novel_url.strip('/') + '/chapters/' + data_id
-            f = self.executor.submit(self.get_soup, url, headers={
-                'x-xsrf-token': xsrf_token,
-                'referer': self.novel_url,
-                'accept': 'application/json, text/plain, */*',
-            })
-            futures[vol_id] = f
-        # end for
-
-        for vol_id, f in sorted(futures.items()):
+        for f in futures:
             soup = f.result()
-            assert isinstance(soup, BeautifulSoup)
-            for a in soup.select('.table-row a'):
-                chap_id = 1 + len(self.chapters)
-                self.chapters.append({
-                    'id': chap_id,
-                    'volume': vol_id,
-                    'title': a.text.strip(),
-                    'url': self.absolute_url(a['href'])
-                })
-            # end for
-        # end for
-    # end def
+            for a in soup.select('#chapters ul[role="list"] li a[href]'):
+                chap_id = len(self.chapters) + 1
+                vol_id = 1 + len(self.chapters) // 100
+                if len(self.volumes) < vol_id:
+                    self.volumes.append(Volume(id=vol_id))
+                self.chapters.append(
+                    Chapter(
+                        id=chap_id,
+                        volume=vol_id,
+                        title=a.text.strip(),
+                        url=self.absolute_url(str(a["href"])),
+                    )
+                )
 
     def download_chapter_body(self, chapter):
-        soup = self.get_soup(chapter['url'])
-        content = soup.select_one('#chapter')
-        return self.extract_contents(content)
-    # end def
-# end class
+        soup = self.get_soup(chapter["url"])
+        content = soup.select_one(".chapter")
+        return self.cleaner.extract_contents(content)

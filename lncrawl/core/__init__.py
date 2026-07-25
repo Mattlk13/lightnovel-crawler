@@ -1,95 +1,68 @@
-# -*- coding: utf-8 -*-
+"""Crawler core: base classes, templates and shared models.
+
+Submodules are imported lazily via ``__getattr__`` so that ``import
+lncrawl.core`` (and every source that imports from it) only pays for what it
+actually uses — e.g. a ``SoupTemplate`` source never loads ``Browser`` and its
+webdriver stack. The ``TYPE_CHECKING`` block keeps these names statically
+resolvable for pyright.
 """
-Interactive application to take user inputs
-"""
-import logging
-import os
-import sys
 
-import colorama
-import urllib3
-from colorama import Fore
+from typing import TYPE_CHECKING, Any
 
-from ..assets.version import get_version
-from ..bots import run_bot
-from .arguments import get_args
-from .display import (cancel_method, debug_mode, description, epilog,
-                      error_message, input_suppression)
-from .sources import load_sources
+if TYPE_CHECKING:
+    from scraper import PageSoup, Scraper
 
-logger = logging.getLogger(__name__)
+    from .browser import Browser
+    from .cleaner import TextCleaner
+    from .crawler import Crawler
+    from .legacy import LegacyCrawler
+    from .models import Chapter, CombinedSearchResult, Novel, SearchResult, Volume
+    from .taskman import TaskManager
+    from .template import BrowserTemplate, CrawlerTemplate, SoupTemplate
 
+__all__ = [
+    "Crawler",
+    "PageSoup",
+    "Scraper",
+    "TaskManager",
+    "TextCleaner",
+    "Novel",
+    "Volume",
+    "Chapter",
+    "SearchResult",
+    "CombinedSearchResult",
+    "CrawlerTemplate",
+    "LegacyCrawler",
+    "SoupTemplate",
+    "Browser",
+    "BrowserTemplate",
+]
 
-def init():
-    os.environ['version'] = get_version()
-
-    colorama.init(wrap=True)
-    description()
-
-    args = get_args()
-
-    levels = ['NOTSET', 'WARN', 'INFO', 'DEBUG']
-    level = os.getenv('LOG_LEVEL')
-    if not level:
-        level = levels[args.log] if args.log else 'NOTSET'
-        os.environ['LOG_LEVEL'] = level
-        urllib3.disable_warnings()
-    # end if
-    if level != 'NOTSET':
-        os.environ['debug_mode'] = 'yes'
-        logging.basicConfig(
-            level=logging.getLevelName(level),
-            format=Fore.CYAN + '%(asctime)s '
-            + Fore.RED + '[%(levelname)s] '
-            + Fore.YELLOW + '(%(name)s)\n'
-            + Fore.WHITE + '%(message)s' + Fore.RESET,
-        )
-        debug_mode(level)
-    # end if
-
-    if args.suppress:
-        input_suppression()
-        print(args)
-    # end if
-
-    if args.bot:
-        os.environ['BOT'] = args.bot
-    # end if
-
-    for key, val in args.extra.items():
-        os.environ[key] = val[0]
-    # end for
-
-    # requests.urllib3.disable_warnings(
-    #     requests.urllib3.exceptions.InsecureRequestWarning)
-    # # end if
-# end def
+# name -> submodule (relative to this package, or "scraper" for the external one)
+_LAZY: dict[str, str] = {
+    "PageSoup": "scraper",
+    "Scraper": "scraper",
+    "Browser": ".browser",
+    "TextCleaner": ".cleaner",
+    "Crawler": ".crawler",
+    "LegacyCrawler": ".legacy",
+    "Chapter": ".models",
+    "CombinedSearchResult": ".models",
+    "Novel": ".models",
+    "SearchResult": ".models",
+    "Volume": ".models",
+    "TaskManager": ".taskman",
+    "BrowserTemplate": ".template",
+    "CrawlerTemplate": ".template",
+    "SoupTemplate": ".template",
+}
 
 
-def start_app():
-    init()
+def __getattr__(name: str) -> Any:
+    module = _LAZY.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
 
-    load_sources()
-    cancel_method()
-
-    try:
-        bot = os.getenv('BOT', '').lower()
-        run_bot(bot)
-    except Exception as err:
-        if os.getenv('debug_mode') == 'yes':
-            raise err
-        elif not any(isinstance(err, t) for t in [KeyError, KeyboardInterrupt]):
-            error_message()
-        # end if
-    # end try
-
-    epilog()
-
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        try:
-            input('Press ENTER to exit...')
-        except EOFError:
-            pass
-        # end try
-    # end if
-# end def
+    package = None if module == "scraper" else __name__
+    return getattr(import_module(module, package), name)

@@ -1,19 +1,76 @@
-version: '3'
+name: lncrawl
 
 services:
-  discord-bot:
+  server:
     image: lncrawl
-    build:
-      context: .
-      dockerfile: ./scripts/Dockerfile
-    command: python -m lncrawl --bot discord --shard-id 0 --shard-count 1 --suppress
+    restart: unless-stopped
+    ports:
+      - "8181:8181"
+    command: -ll server -p 8181
     environment:
-      BOT: discord
-      LOG_LEVEL: ERROR
-      CLOUD_DRIVE: "${CLOUD_DRIVE}"
-      DISCORD_TOKEN: "${DISCORD_TOKEN}"
-      DISCORD_SIGNAL_CHAR: "${DISCORD_SIGNAL_CHAR}"
-      DISCORD_DISABLE_SEARCH: "${DISCORD_DISABLE_SEARCH}"
-      TELEGRAM_TOKEN: "${TELEGRAM_TOKEN}"
-      GOOGLE_DRIVE_CREDENTIAL_FILE: "${GOOGLE_DRIVE_CREDENTIAL_FILE}"
-      GOOGLE_DRIVE_FOLDER_ID: "${GOOGLE_DRIVE_FOLDER_ID}"
+      - LNCRAWL_DATA_PATH=/data
+      - DATABASE_URL=postgresql+psycopg://pguser:pgpass@postgres:5432/lncrawl
+    volumes:
+      - appdata:/data
+    depends_on:
+      - postgres
+      - calibre-api
+      - translator
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    platform: linux/amd64
+    shm_size: 128mb
+    ports:
+      - "0.0.0.0:5432:5432"
+    environment:
+      POSTGRES_DB: lncrawl
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  calibre-api:
+    image: ghcr.io/lncrawl/ebook-convert-api:v0.2.0
+    restart: unless-stopped
+    ports:
+      - "8182:8000"
+    environment:
+      MAX_UPLOAD_MB: "1024"
+      MAX_CONCURRENT_JOBS: "4"
+      CONVERSION_TIMEOUT_SECONDS: "300"
+
+  # Reached by the server at http://translator:8184 (set translator.api_url in
+  # admin settings). Port is intentionally NOT published: the service is
+  # unauthenticated, so it stays on the internal network and the dashboard is
+  # reached only through the server's admin-only /api/translator proxy.
+  translator:
+    image: ghcr.io/lncrawl/translator:latest
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: "INFO"
+    volumes:
+      - translator_data:/data
+
+  torproxy:
+    image: sdipu/tor-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "9150:9150" # socks5 port
+      - "9151:9151" # control port
+    volumes:
+      - tor_data:/var/lib/tor
+    environment:
+      SOCKS_HOST: 0.0.0.0
+      CONTROL_HOST: 0.0.0.0
+      CONTROL_PASSWORD: "secret"
+      SOCKS_POLICY: accept 127.0.0.1,accept 10.0.0.0/8,accept 172.16.0.0/12,accept 192.168.0.0/16
+
+volumes:
+  pgdata:
+  appdata:
+  tor_data:
+  translator_data:

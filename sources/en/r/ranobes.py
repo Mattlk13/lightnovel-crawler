@@ -1,111 +1,93 @@
 # -*- coding: utf-8 -*-
+from concurrent.futures import Future
+import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import re
+from typing import List, Optional
+from urllib.parse import quote_plus, urljoin
 
-import js2py
-from bs4.element import Tag
-
-from lncrawl.core.crawler import Crawler
+from lncrawl.core import Chapter, Novel, PageSoup, SoupTemplate, Volume
+from lncrawl.exceptions import LNException
 
 logger = logging.getLogger(__name__)
 
 
-class RanobeLibCrawler(Crawler):
+digit_regex = re.compile(r"\/(\d+)-")
+
+
+class RanobeLibCrawler(SoupTemplate):
     base_url = [
-        'http://ranobes.net/',
-        'https://ranobes.net/',
+        "https://ranobes.top/",
+        "https://ranobes.net/",
     ]
 
+    search_item_list_selector = ".short-cont .title a"
+
+    novel_title_selector = "h1.title"
+    novel_cover_selector = ".r-fullstory-poster .poster a img"
+    novel_author_selector = '.tag_list a[href*="/authors/"]'
+    chapter_list_selector = ".cat_line a"
+    chapter_title_selector = ".cat_line a"
+
     def initialize(self) -> None:
-        self.executor = ThreadPoolExecutor(max_workers=1)
-    # end def
+        self.cleaner.bad_css.update([".free-support", 'div[id^="adfox_"]'])
 
-    def read_novel_info(self):
-        logger.info('Visiting %s', self.novel_url)
-        soup = self.get_soup(self.novel_url)
+    def build_search_url(self, query: str) -> str:
+        return urljoin(self.scraper.origin, "/search/{}/".format(quote_plus(query)))
 
-        main_page_link = soup.select_one('#mainside, .breadcrumbs-panel')
-        if isinstance(main_page_link, Tag):
-            main_page_link = main_page_link.select_one('a[href*="/novels/"]')
-            if isinstance(main_page_link, Tag):
-                self.novel_url = self.absolute_url(main_page_link['href'])
-                logger.info('Visiting %s', self.novel_url)
-                soup = self.get_soup(self.novel_url)
+    def parse_chapter_list(
+        self,
+        tag: PageSoup,
+        novel: Novel,
+        volume: Optional[Volume] = None,
+    ) -> None:
+        id_match = digit_regex.search(novel.url)
+        if not id_match:
+            raise LNException("Could not extract novel id from URL")
 
-        possible_title = soup.select_one('meta[property="og:title"]')
-        assert isinstance(possible_title, Tag)
-        self.novel_title = possible_title['content']
-        logger.info('Novel title: %s', self.novel_title)
+        novel.id = id_match.group(1)
+        chapter_list_url = urljoin(self.scraper.origin, f"/chapters/{novel.id}/")
+        tag = self.scraper.get_soup(chapter_list_url)
 
-        possible_cover = soup.select_one('meta[property="og:image"]')
-        if isinstance(possible_cover, Tag):
-            self.novel_cover = self.absolute_url(possible_cover['content'])
-        logger.info('Novel cover: %s', self.novel_cover)
+        data = self._extract_page_data(tag)
+        pages_count = data["pages_count"]
+        futures: List[Future[PageSoup]] = []
+        for i in reversed(range(2, pages_count + 1)):
+            chapter_page_url = chapter_list_url.strip("/") + ("/page/%d" % i)
+            task = self.taskman.submit_task(self.scraper.get_soup, chapter_page_url)
+            futures.append(task)
 
-        author_link = soup.select_one('.tag_list a[href*="/authors/"]')
-        if isinstance(author_link, Tag):
-            self.novel_author = author_link.text.strip().title()
-        # end if
-        logger.info('Novel author: %s', self.novel_author)
-
-        chapter_list_link = soup.select_one('#fs-chapters a[title="Go to table of contents"]')
-        assert isinstance(chapter_list_link, Tag)
-        chapter_list_link = self.absolute_url(chapter_list_link['href'])
-
-        logger.info('Visiting %s', chapter_list_link)
-        soup = self.get_soup(chapter_list_link)
-        
-        script = soup.find(lambda tag: isinstance(tag, Tag) and tag.name == 'script' and tag.text.startswith('window.__DATA__'))
-        assert isinstance(script, Tag)
-
-        data = js2py.eval_js(script.text).to_dict()
-        assert isinstance(data, dict)
-
-        pages_count = data['pages_count']
-        logger.info('Total pages: %d', pages_count)
-
-        futures = []
-        page_soups = [soup]
-        for i in range(2, pages_count + 1):
-            chapter_page_url = chapter_list_link.strip('/') + ('/page/%d' % i)
-            f = self.executor.submit(self.get_soup, chapter_page_url)
-            futures.append(f)
-        page_soups += [f.result() for f in futures]
-
-        volumes = set([])
-        for soup in reversed(page_soups):
-            script = soup.find(lambda tag: isinstance(tag, Tag) and tag.name == 'script' and tag.text.startswith('window.__DATA__'))
-            assert isinstance(script, Tag)
-
-            data = js2py.eval_js(script.text).to_dict()
-            assert isinstance(data, dict)
-
-            for chapter in reversed(data['chapters']):
-                chap_id = len(self.chapters) + 1
-                vol_id = len(self.chapters) // 100 + 1
-                volumes.add(vol_id)
-                self.chapters.append({
-                    'id': chap_id,
-                    'volume': vol_id,
-                    'title': chapter['title'],
-                    'url': 'https://ranobes.net/read-%s.html' % chapter['id'],
-                })
-
-        self.volumes = [{'id': x} for x in volumes]
-    # end def
-
-    def download_chapter_body(self, chapter):
-        logger.info('Downloading %s', chapter['url'])
-        soup = self.get_soup(chapter['url'])
-
-        article = soup.select_one('.text[itemprop="description"]')
-
-        self.bad_css += [
-            '.free-support',
-            'div[id^="adfox_"]'
+        page_soups = [tag] + [
+            page
+            for page in self.taskman.resolve(
+                futures,
+                desc="Chapters",
+                unit="page",
+            )
+            if page
         ]
-        self.clean_contents(article)
 
-        return str(article)
-    # end def
-# end class
+        novel.chapters = []
+        for page in page_soups:
+            data = self._extract_page_data(page)
+            for chapter in reversed(data["chapters"]):
+                chapter_id = len(novel.chapters) + 1
+                chapter = Chapter(
+                    id=chapter_id,
+                    title=chapter["title"],
+                    url=self.absolute_url(chapter["link"]),
+                )
+                novel.chapters.append(chapter)
+
+    def _extract_page_data(self, soup: PageSoup) -> dict:
+        script = soup.find(
+            lambda tag: (
+                bool(tag) and tag.name == "script" and tag.text.startswith("window.__DATA__")
+            )
+        )
+
+        content = script.text.strip()
+        content = content.replace("window.__DATA__ = ", "")
+
+        data = json.loads(content)
+        return data

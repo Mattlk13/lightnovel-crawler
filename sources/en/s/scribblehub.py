@@ -1,120 +1,105 @@
 # -*- coding: utf-8 -*-
 import logging
-from math import ceil
-from urllib.parse import quote
+import re
+from typing import Iterable, Optional
 
-from bs4 import Tag
-
-from lncrawl.core.crawler import Crawler
+from lncrawl.core import Novel, PageSoup, SoupTemplate, Volume
 
 logger = logging.getLogger(__name__)
-search_url = 'https://www.scribblehub.com/?s=%s&post_type=fictionposts'
-chapter_post_url = 'https://www.scribblehub.com/wp-admin/admin-ajax.php'
 
-class ScribbleHubCrawler(Crawler):
-    base_url = 'https://www.scribblehub.com/'
+digit_regex = re.compile(r"\?toc=(\d+)#content1$")
 
-    def search_novel(self, query):
-        url = search_url % quote(query.lower())
-        logger.debug('Visiting %s', url)
-        soup = self.get_soup(url)
 
-        results = []
-        for novel in soup.select('div.search_body'):
-            a = novel.select_one('.search_title a')
-            info = novel.select_one('.search_stats')
-            if not isinstance(a, Tag):
-                continue
-            # end if
-            results.append({
-                'title': a.text.strip(),
-                'url': self.absolute_url(a['href']),
-                'info': info.text.strip() if isinstance(info, Tag) else '',
-            })
-        # end for
-        return results
-    # end def
+class ScribbleHubCrawler(SoupTemplate):
+    base_url = "https://www.scribblehub.com/"
+    has_manga = False
+    has_mtl = False
 
-    def read_novel_info(self):
-        logger.debug('Visiting %s', self.novel_url)
-        soup = self.get_soup(self.novel_url)
+    novel_url_selector = ".fictionposts-template-default"
+    novel_title_selector = ".fic_title"
+    novel_cover_selector = ".fic_image img"
+    novel_author_selector = ".auth_name_fic"
+    novel_tags_selector = "a.fic_genre"
+    novel_synopsis_selector = ".wi_fic_desc"
 
-        possible_title = soup.find('div', {'class': 'fic_title'})
-        assert isinstance(possible_title, Tag)
-        self.novel_title = str(possible_title['title']).strip()
-        logger.info('Novel title: %s', self.novel_title)
+    chapter_list_selector = ".toc_ol a.toc_a"
+    chapter_body_selector = "#chp_raw"
 
-        possible_image = soup.find('div', {'class': 'fic_image'})
-        if isinstance(possible_image, Tag):
-            possible_image = possible_image.find('img')
-            if isinstance(possible_image, Tag):
-                self.novel_cover = self.absolute_url(possible_image['src'])
-        logger.info('Novel cover: %s', self.novel_cover)
+    def initialize(self) -> None:
+        self.cleaner.bad_css.update(
+            [
+                ".p-avatar-wrap",
+                ".sp-head",
+                ".spdiv",
+                ".chp_stats_feature",
+                ".modern-footnotes-footnote",
+                ".modern-footnotes-footnote__note",
+                ".wi_authornotes",
+            ]
+        )
+        self.cleaner.whitelist_attributes.update(
+            [
+                "border",
+                "class",
+            ]
+        )
+        self.cleaner.whitelist_css_property.update(
+            [
+                "text-align",
+            ]
+        )
 
-        possible_author = soup.find('span', {'class': 'auth_name_fic'})
-        if isinstance(possible_author, Tag):
-            self.novel_author = possible_author.text.strip()
-        logger.info('Novel author: %s', self.novel_author)
+    # def visit_novel_page_in_browser(self) -> PageSoup:
+    #     url_parts = self.novel_url.split("/")
+    #     self.novel_url = f"{url_parts[0]}/{url_parts[2]}/{url_parts[3]}/{url_parts[4]}/"
+    #     logger.debug(self.novel_url)
+    #     self.visit(self.novel_url)
+    #     self.browser.wait(".fictionposts-template-default")
 
-        chapter_count = soup.find('span', {'class': 'cnt_toc'})
-        chapter_count = int(chapter_count.text) if isinstance(chapter_count, Tag) else -1
-        page_count = ceil(chapter_count / 15.0)
-        logger.info('Chapter list pages: %d' % page_count)
+    def select_chapter_tags(
+        self,
+        tag: PageSoup,
+        novel: Novel,
+        volume: Optional[Volume] = None,
+    ) -> Iterable[PageSoup]:
+        chapter_count = -1
+        chapter_count_tag = tag.select_one("span.cnt_toc")
+        if chapter_count_tag.text.isdigit():
+            chapter_count = int(chapter_count_tag.text)
+        novel.chapter_count = chapter_count
 
-        possible_mypostid = soup.select_one('input#mypostid')
-        assert isinstance(possible_mypostid, Tag)
-        mypostid = int(str(possible_mypostid['value']))
-        logger.info('#mypostid = %d', mypostid)
-        
-        possible_chpcounter = soup.select_one('input#chpcounter')
-        assert isinstance(possible_chpcounter, Tag)
-        chpcounter = int(str(possible_chpcounter['value']))
-        logger.info('#chpcounter = %d', chpcounter)
+        mypostid_tag = tag.select_one("input#mypostid[value]")
+        mypostid = int(str(mypostid_tag["value"]))
+        novel.mypostid = mypostid
 
-        toc_show = 50
-        page_count = ceil(chpcounter / toc_show)
-        logger.info('#page count = %d', page_count)
+        response = self.scraper.submit_form(
+            f"{self.scraper.origin}wp-admin/admin-ajax.php",
+            {
+                "action": "wi_getreleases_pagination",
+                "pagenum": -1,
+                "mypostid": mypostid,
+            },
+        )
+        tag = self.scraper.make_soup(response)
+        return reversed(tag.select(self.chapter_list_selector))
 
-        futures_to_check = []
-        for i in range(page_count):
-            future = self.executor.submit(self.submit_form, chapter_post_url, {
-                'action': 'wi_getreleases_pagination',
-                'pagenum': page_count - i,
-                'mypostid': mypostid,
-            }, headers={
-                'cookie': 'toc_show=' + str(toc_show),
-            })
-            futures_to_check.append(future)
-        # end for
+    # def parse_chapter_list_in_browser(
+    #     self,
+    # ) -> Generator[Union[Chapter, Volume], None, None]:
+    #     _pages = max(
+    #         [
+    #             int(digit_regex.search(a["href"]).group(1))
+    #             for a in self.browser.soup.select(".simple-pagination a")
+    #             if digit_regex.search(a["href"]) is not None
+    #         ]
+    #     )
+    #     if not _pages:
+    #         _pages = 1
+    #     tags = self.browser.soup.select(".main .toc li a")
+    #     for i in range(2, _pages + 1):
+    #         self.browser.visit(urljoin(self.novel_url, f"?toc={i}#content1"))
+    #         self.browser.wait(".main")
+    #         tags += self.browser.soup.select(".main .toc li a")
 
-        volumes = set()
-        for f in futures_to_check:
-            response = f.result()
-            soup = self.make_soup(response)
-            for chapter in reversed(soup.select('.toc_ol a.toc_a')):
-                chap_id = len(self.chapters) + 1
-                vol_id = len(self.chapters) // 100 + 1
-                volumes.add(vol_id)
-                self.chapters.append({
-                    'id': chap_id,
-                    'volume': vol_id,
-                    'url': self.absolute_url(str(chapter['href'])),
-                    'title': chapter.text.strip() or ('Chapter %d' % chap_id),
-                })
-            # end for
-        # end for
-
-        self.volumes = [{'id': x} for x in volumes]
-    # end def
-
-    def download_chapter_body(self, chapter):
-        logger.info('Downloading %s', chapter['url'])
-        soup = self.get_soup(chapter['url'])
-        contents = soup.select_one('div#chp_raw')
-        self.bad_css += [
-            '.modern-footnotes-footnote',
-            '.modern-footnotes-footnote__note',
-        ]
-        return self.extract_contents(contents)
-    # end def
-# end class
+    #     for _id, _t in enumerate(reversed(tags)):
+    #         yield Chapter(id=_id, url=self.absolute_url(_t.get("href")), title=_t.text.strip())
